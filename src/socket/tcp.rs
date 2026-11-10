@@ -1863,10 +1863,17 @@ impl<'a> Socket<'a> {
 
                     self.local_rx_last_seq = Some(repr.seq_number);
 
-                    (
-                        &repr.payload[overlap_start - segment_start..overlap_end - segment_start],
-                        overlap_start - window_start,
-                    )
+                    if self.rx_fin_received {
+                        // The remote sends nothing after its FIN, so ignore the
+                        // segment text (RFC 9293 3.10.7.4, seventh).
+                        (&[][..], 0)
+                    } else {
+                        (
+                            &repr.payload
+                                [overlap_start - segment_start..overlap_end - segment_start],
+                            overlap_start - window_start,
+                        )
+                    }
                 } else {
                     // Out-of-window RSTs are silently dropped, per RFC 9293
                     // (3.10.7.4) and RFC 5961 (3.2): no reply is sent, and the
@@ -2141,6 +2148,16 @@ impl<'a> Socket<'a> {
             }
         }
 
+        // Whether this segment fills a gap, for the immediate ACK below. Taken
+        // before a FIN clears the assembler.
+        let assembler_was_empty = self.assembler.is_empty();
+
+        // A FIN that got this far was taken, and ends the stream at its sequence
+        // number. Any text held out of order past it will never be read.
+        if control == TcpControl::Fin {
+            self.assembler.clear();
+        }
+
         // Update remote state.
         self.remote_last_ts = Some(cx.now());
 
@@ -2294,8 +2311,6 @@ impl<'a> Socket<'a> {
         if payload_len == 0 {
             return None;
         }
-
-        let assembler_was_empty = self.assembler.is_empty();
 
         // Try adding payload octets to the assembler.
         let Ok(contig_len) = self
@@ -5476,6 +5491,83 @@ mod test {
             })
         );
         assert_eq!(s.state, State::Established);
+    }
+
+    #[test]
+    fn test_established_fin_drops_data_held_past_it() {
+        let mut s = socket_established();
+        // Data past the FIN arrives first and is held out of order.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 2,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"c"[..],
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                ..RECV_TEMPL
+            })
+        );
+        // The FIN comes right after "ab", where "c" was held. The segment fills
+        // the gap, so it is acknowledged at once (RFC 5681 4.2), up to the FIN.
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Fin,
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"ab"[..],
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 2 + 1),
+                window_len: 62,
+                ..RECV_TEMPL
+            })
+        );
+        assert_eq!(s.state, State::CloseWait);
+        s.recv(|data| {
+            assert_eq!(data, b"ab");
+            (2, ())
+        })
+        .unwrap();
+        assert_eq!(s.recv(|_| (0, ())), Err(RecvError::Finished));
+    }
+
+    #[test]
+    fn test_close_wait_ignores_data_past_fin() {
+        let mut s = socket_established();
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Fin,
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"ab"[..],
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::CloseWait);
+        // Data after the FIN is never read.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 2 + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"z"[..],
+                ..SEND_TEMPL
+            }
+        );
+        s.recv(|data| {
+            assert_eq!(data, b"ab");
+            (2, ())
+        })
+        .unwrap();
+        assert_eq!(s.recv(|_| (0, ())), Err(RecvError::Finished));
     }
 
     #[test]
