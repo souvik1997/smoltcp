@@ -1967,6 +1967,13 @@ impl<'a> Socket<'a> {
             control = TcpControl::None;
         }
 
+        // A FIN after the remote's first changes nothing (RFC 9293 3.10.7.4,
+        // eighth: remain in the state), but the ACK it carries still counts.
+        if control == TcpControl::Fin && self.rx_fin_received {
+            tcp_trace!("ignoring FIN because we already received one");
+            control = TcpControl::None;
+        }
+
         // Validate and update the state.
         match (self.state, control) {
             // RSTs are not accepted in the LISTEN state.
@@ -5571,6 +5578,40 @@ mod test {
     }
 
     #[test]
+    fn test_close_wait_ignores_data_beside_second_fin() {
+        let mut s = socket_established();
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Fin,
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"ab"[..],
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::CloseWait);
+        // A second FIN is processed as a plain segment, and its text is
+        // past the first FIN, so it is never read either.
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Fin,
+                seq_number: REMOTE_SEQ + 1 + 2 + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"z"[..],
+                ..SEND_TEMPL
+            }
+        );
+        s.recv(|data| {
+            assert_eq!(data, b"ab");
+            (2, ())
+        })
+        .unwrap();
+        assert_eq!(s.recv(|_| (0, ())), Err(RecvError::Finished));
+    }
+
+    #[test]
     fn test_established_send_fin() {
         let mut s = socket_established();
         s.send_slice(b"abcdef").unwrap();
@@ -5920,6 +5961,42 @@ mod test {
         assert_eq!(s.state, State::Closing);
     }
 
+    #[test]
+    fn test_closing_ack_fin_beside_second_fin() {
+        let mut s = socket_established();
+        s.close();
+        recv!(
+            s,
+            [TcpRepr {
+                control: TcpControl::Fin,
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                ..RECV_TEMPL
+            }]
+        );
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Fin,
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::Closing);
+        // A second FIN must not hide the ACK of our FIN beside it.
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Fin,
+                seq_number: REMOTE_SEQ + 1 + 1,
+                ack_number: Some(LOCAL_SEQ + 1 + 1),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::TimeWait);
+    }
+
     // =========================================================================================//
     // Tests for the TIME-WAIT state.
     // =========================================================================================//
@@ -6188,6 +6265,43 @@ mod test {
         let mut s = socket_last_ack();
         s.close();
         assert_eq!(s.state, State::LastAck);
+    }
+
+    #[test]
+    fn test_last_ack_ack_fin_beside_second_fin() {
+        let mut s = socket_established();
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Fin,
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::CloseWait);
+        s.close();
+        recv!(
+            s,
+            [TcpRepr {
+                control: TcpControl::Fin,
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 1),
+                ..RECV_TEMPL
+            }]
+        );
+        assert_eq!(s.state, State::LastAck);
+        // A second FIN must not hide the ACK of our FIN beside it.
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Fin,
+                seq_number: REMOTE_SEQ + 1 + 1,
+                ack_number: Some(LOCAL_SEQ + 1 + 1),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::Closed);
     }
 
     // =========================================================================================//
