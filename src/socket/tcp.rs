@@ -1718,12 +1718,15 @@ impl<'a> Socket<'a> {
             // This is required by RFC 9293, which states "A TCP implementation MUST support
             // simultaneous open attempts (MUST-10)."
             (State::SynSent, TcpControl::Syn, None) => (),
-            // ACKs in the SYN-SENT state are invalid.
-            (State::SynSent, TcpControl::None, Some(ack_number)) => {
-                // If the sequence number matches, ignore it instead of RSTing.
-                // I'm not sure why, I think it may be a workaround for broken TCP
-                // servers, or a defense against reordering. Either way, if Linux
-                // does it, we do too.
+            // An ACK without SYN in the SYN-SENT state, with or without PSH or FIN.
+            (
+                State::SynSent,
+                TcpControl::None | TcpControl::Psh | TcpControl::Fin,
+                Some(ack_number),
+            ) => {
+                // RFC 9293 3.10.7.3: an acceptable ACK (SND.UNA < SEG.ACK =< SND.NXT)
+                // on a segment with neither SYN nor RST is dropped. Any other ACK
+                // gets a RST.
                 if ack_number == self.local_seq_no + 1 {
                     net_debug!(
                         "expecting a SYN|ACK, received an ACK with the right ack_number, ignoring."
@@ -4426,6 +4429,44 @@ mod test {
 
         // It should trigger a RST, and change no state
         assert_eq!(s.state, State::SynSent);
+    }
+
+    #[test]
+    fn test_syn_sent_bad_ack_psh_or_fin() {
+        for control in [TcpControl::Psh, TcpControl::Fin] {
+            let mut s = socket_syn_sent();
+            recv!(
+                s,
+                [TcpRepr {
+                    control: TcpControl::Syn,
+                    seq_number: LOCAL_SEQ,
+                    ack_number: None,
+                    max_seg_size: Some(BASE_MSS),
+                    window_scale: Some(0),
+                    sack_permitted: true,
+                    ..RECV_TEMPL
+                }]
+            );
+            send!(
+                s,
+                TcpRepr {
+                    control,
+                    seq_number: REMOTE_SEQ,
+                    ack_number: Some(LOCAL_SEQ + 5), // WRONG
+                    ..SEND_TEMPL
+                },
+                Some(TcpRepr {
+                    control: TcpControl::Rst,
+                    seq_number: LOCAL_SEQ + 5,
+                    ack_number: None,
+                    window_len: 0,
+                    ..RECV_TEMPL
+                })
+            );
+
+            // PSH or FIN does not change the answer: a RST, and no change of state
+            assert_eq!(s.state, State::SynSent);
+        }
     }
 
     #[test]
