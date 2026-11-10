@@ -1903,7 +1903,7 @@ impl<'a> Socket<'a> {
                     // One per second is ample for a restarted peer to complete
                     // the challenge exchange, since it retransmits its SYN on
                     // its own timer.
-                    if !repr.payload.is_empty()
+                    if repr.segment_len() > 0
                         && matches!(
                             repr.control,
                             TcpControl::None | TcpControl::Psh | TcpControl::Fin
@@ -5885,6 +5885,38 @@ mod test {
                 expires_at: Instant::from_secs(5) + CLOSE_DELAY
             }
         );
+    }
+
+    #[test]
+    fn test_time_wait_retransmit_after_challenge_ack() {
+        let mut s = socket_time_wait(false);
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1 + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 1),
+                ..RECV_TEMPL
+            }]
+        );
+        let ack = Some(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 1,
+            ack_number: Some(REMOTE_SEQ + 1 + 1),
+            ..RECV_TEMPL
+        });
+        // A SYN draws a challenge ACK, which starts the rate limit.
+        send!(s, time 5_000, TcpRepr {
+            control: TcpControl::Syn,
+            seq_number: REMOTE_SEQ + 1000,
+            ack_number: Some(LOCAL_SEQ + 1 + 1),
+            ..SEND_TEMPL
+        }, ack);
+        // A retransmitted FIN is still acknowledged.
+        send!(s, time 5_100, TcpRepr {
+            control: TcpControl::Fin,
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1 + 1),
+            ..SEND_TEMPL
+        }, ack);
     }
 
     #[test]
